@@ -54,7 +54,9 @@ it. The suite does not validate real systemd scheduling or GUI compatibility.
 
 An active service is not proof of application readiness: no xpra client/server
 handshake or WeChat GUI readiness is claimed, and a service can fail after a
-successful check. These tests use `WX_IME=none` and disable the X11 overlay;
-IME startup/readiness and overlay behavior are unchanged and unvalidated. The
+successful check. `StartupTests` use `WX_IME=none`; `IbusStartupTests` use
+`WX_IME=ibus` (no engine switch, no panel guard) and check that a failed
+`wx-ibus` launch or a missing ibus address file stops startup before WeChat.
+fcitx5 startup and the X11 overlay remain unvalidated. The
 independent same-user process-selection issue and shutdown error behavior are
 outside this change.

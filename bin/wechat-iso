@@ -84,11 +84,16 @@ start_ibus() {
       panel=(--panel="$SHARE/ime/ibus/ibus-panel.sh")
     fi
     # 不带 WAYLAND_DISPLAY：否则 ibus 和候选面板会走 Wayland，画不到虚拟屏幕上
-    $RUN --unit=wx-ibus -p UnsetEnvironment=WAYLAND_DISPLAY "${ENVS[@]}" -E DISPLAY="$D" -E GDK_BACKEND=x11 \
-        ibus-daemon --xim --replace "${panel[@]}"
-    local pid; pid=$(systemctl --user show -p MainPID --value wx-ibus)
-    for _ in $(seq 1 40); do grep -qs "IBUS_DAEMON_PID=$pid" "$IBUS_BUS-unix-$DNUM" && break; sleep 0.5; done
+    start_unit wx-ibus -p UnsetEnvironment=WAYLAND_DISPLAY "${ENVS[@]}" -E DISPLAY="$D" -E GDK_BACKEND=x11 \
+        ibus-daemon --xim --replace "${panel[@]}" || return 1
   fi
+  # 等 ibus 写好虚拟屏幕的地址文件；没写好就启动微信，微信会连不上输入法且不再重试
+  local pid ready=0; pid=$(systemctl --user show -p MainPID --value wx-ibus)
+  for _ in $(seq 1 40); do
+    grep -qs "IBUS_DAEMON_PID=$pid" "$IBUS_BUS-unix-$DNUM" && { ready=1; break; }
+    sleep 0.5
+  done
+  [ "$ready" = 1 ] || { startup_failed wx-ibus; return 1; }
   if [ "$WX_IBUS_WAYLAND_ALIAS" = 1 ]; then
     # 启动器强制 WAYLAND_DISPLAY=wayland-0 时，微信会读 …-unix-wayland-0 这个地址文件；把它指向虚拟屏幕的 ibus
     ln -sfn "$(basename "$IBUS_BUS")-unix-$DNUM" "$IBUS_BUS-unix-wayland-0"
@@ -99,13 +104,16 @@ start_ibus() {
       [ "$(DISPLAY=$D timeout 5 ibus engine 2>/dev/null)" = "$WX_IBUS_ENGINE" ] && break
       DISPLAY=$D timeout 15 ibus engine "$WX_IBUS_ENGINE" 2>/dev/null; sleep 2
     done
+    # 引擎没切过去不影响微信本身，只提示，不中止启动
+    [ "$(DISPLAY=$D timeout 5 ibus engine 2>/dev/null)" = "$WX_IBUS_ENGINE" ] ||
+      echo "警告：没能切到输入法引擎 $WX_IBUS_ENGINE，用 ibus list-engine 确认引擎名" >&2
   fi
 }
 
 start_fcitx5() {
   # 实验性，未充分测试：fcitx5 走 D-Bus 会话总线，和桌面上已运行的 fcitx5 会冲突（见 docs/ime.md）
-  running wx-ime || $RUN --unit=wx-ime -p UnsetEnvironment=WAYLAND_DISPLAY "${ENVS[@]}" -E DISPLAY="$D" \
-      -E GDK_BACKEND=x11 fcitx5 --replace
+  start_unit wx-ime -p UnsetEnvironment=WAYLAND_DISPLAY "${ENVS[@]}" -E DISPLAY="$D" \
+      -E GDK_BACKEND=x11 fcitx5 --replace || return 1
   sleep 2
 }
 
@@ -129,7 +137,7 @@ up() {
   sleep 3
   running wx-xpra || { startup_failed wx-xpra; return 1; }
   # 输入法必须先于微信就绪：微信启动时连一次输入法，连不上不会重试
-  case "$WX_IME" in ibus) start_ibus ;; fcitx5) start_fcitx5 ;; esac
+  case "$WX_IME" in ibus) start_ibus || return 1 ;; fcitx5) start_fcitx5 || return 1 ;; esac
   if [ -z "$(wechat_pid)" ]; then
     # shellcheck disable=SC2046,SC2086
     start_unit wx-wechat -p UnsetEnvironment=WAYLAND_DISPLAY "${ENVS[@]}" -E DISPLAY="$D" -E QT_QPA_PLATFORM=xcb \

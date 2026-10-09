@@ -34,7 +34,10 @@ with open(os.environ["FIXTURE_LOG"], "a") as log:
     log.write(json.dumps({"command": name, "args": args}) + "\n")
 
 def finish(code=0, output=None):
-    state_path.write_text(json.dumps(state))
+    # 原子替换：管道里的两个桩程序（如 pgrep | head）会并发读写，直接覆盖会被读到空文件
+    tmp = state_path.with_name(f"{state_path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(state))
+    os.replace(tmp, state_path)
     if output is not None:
         print(output)
     sys.exit(code)
@@ -63,6 +66,8 @@ if name == "systemctl":
         finish(0 if active else 3,
                None if "--quiet" in options else ("active" if active else "inactive"))
     if operation == "cat": finish(0 if unit in state.get("units", {}) else 1)
+    if operation == "show" and unit == "wx-ibus":
+        finish(output="880003" if state.get("units", {}).get(unit) else "0")
     if operation == "show" and unit == "wx-wechat":
         finish(output=str(state.get("wechat_pid", 0)
                           if state.get("units", {}).get(unit) else 0))
@@ -87,6 +92,13 @@ if name == "xdpyinfo":
     ready = (state.get("units", {}).get("wx-xvfb", False)
              and state["display_checks"] >= state.get("display_ready_after", 1))
     finish(0 if ready else 1)
+if name == "pkill" and "ibus-daemon .*--desktop=xpra" in args:
+    finish(1)  # 没有 xpra 自带的 ibus 需要清理
+if name == "grep" and any(arg.startswith("IBUS_DAEMON_PID=") for arg in args):
+    # ibus 写好虚拟屏幕地址文件
+    finish(0 if state.get("units", {}).get("wx-ibus") and not state.get("ibus_never_ready") else 1)
+if name == "timeout" and args[1:3] == ["ibus", "engine"]:
+    finish(output="")  # status 查询当前引擎
 if name == "xpra":
     state.setdefault("unexpected", []).append([name, args])
     finish(91)
@@ -99,7 +111,7 @@ xdpyinfo xpra xdotool xprop python3 ibus ibus-daemon fcitx5 Xvfb xclip pkill
 timeout sudo mount umount ln rm grep journalctl""".split()
 
 
-def scenario(actions=("up",), state=None):
+def scenario(actions=("up",), state=None, config_extra=""):
     with tempfile.TemporaryDirectory(prefix="wechat-startup-test-") as directory:
         root = Path(directory)
         mock_bin = root / "bin"
@@ -110,7 +122,7 @@ def scenario(actions=("up",), state=None):
         config.mkdir(parents=True)
         (config / "config.sh").write_text(
             'WX_IME=none\nWX_X11_OVERLAY=0\nWX_IBUS_WAYLAND_ALIAS=0\n'
-            'WX_CMD=/synthetic/wechat\nWX_ARGS=""\nWX_DISPLAY=:100\n'
+            'WX_CMD=/synthetic/wechat\nWX_ARGS=""\nWX_DISPLAY=:100\n' + config_extra
         )
         stub = mock_bin / "stub"
         stub.write_text("#!" + sys.executable + "\n" + STUB)
@@ -244,6 +256,48 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(runs[0].returncode, 0, runs[0].stderr)
         self.assertEqual(launched(calls), [])
         self.assert_preserved(calls, state)
+
+
+IBUS_CONFIG = "WX_IME=ibus\nWX_IBUS_ENGINE=\nWX_IBUS_PANEL_GUARD=0\n"
+IBUS_UNITS = ["wx-xvfb", "wx-xpra", "wx-ibus", "wx-wechat", "wx-attach"]
+
+
+class IbusStartupTests(unittest.TestCase):
+    def assert_safe(self, calls, state):
+        self.assertFalse(state.get("unexpected"), state.get("unexpected"))
+        self.assertFalse(state.get("kill_requests"))
+        self.assertFalse(any(call["command"] == "systemctl"
+                             and any(arg in ("stop", "restart", "kill") for arg in call["args"])
+                             for call in calls))
+
+    def test_ibus_ready_before_wechat(self):
+        runs, calls, state = scenario(config_extra=IBUS_CONFIG)
+        self.assertEqual(runs[0].returncode, 0, runs[0].stderr)
+        self.assertEqual(launched(calls), IBUS_UNITS)
+        ready = max(i for i, call in enumerate(calls) if call["command"] == "grep")
+        wechat = next(i for i, call in enumerate(calls)
+                      if call["command"] == "systemd-run" and "--unit=wx-wechat" in call["args"])
+        self.assertLess(ready, wechat)
+        self.assert_safe(calls, state)
+
+    def test_ibus_launch_failure_stops_before_wechat(self):
+        for key in ("fail_units", "exec_fail_units", "exit_units"):
+            with self.subTest(key=key):
+                runs, calls, state = scenario(state={"units": {}, key: ["wx-ibus"]},
+                                              config_extra=IBUS_CONFIG)
+                self.assertNotEqual(runs[0].returncode, 0)
+                self.assertEqual(launched(calls), IBUS_UNITS[:3])
+                self.assertIn("journalctl --user -u wx-ibus", runs[0].stderr)
+                self.assert_safe(calls, state)
+
+    def test_ibus_address_never_ready_stops_before_wechat(self):
+        runs, calls, state = scenario(state={"units": {}, "ibus_never_ready": True},
+                                      config_extra=IBUS_CONFIG)
+        self.assertNotEqual(runs[0].returncode, 0)
+        self.assertEqual(launched(calls), IBUS_UNITS[:3])
+        self.assertEqual(sum(call["command"] == "grep" for call in calls), 40)
+        self.assertIn("journalctl --user -u wx-ibus", runs[0].stderr)
+        self.assert_safe(calls, state)
 
 
 if __name__ == "__main__":
