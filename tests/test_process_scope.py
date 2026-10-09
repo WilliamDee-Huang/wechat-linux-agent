@@ -19,7 +19,7 @@ name=pathlib.Path(sys.argv[0]).name; args=sys.argv[1:]
 p=pathlib.Path(os.environ['FIXTURE_STATE']); s=json.loads(p.read_text())
 with open(os.environ['FIXTURE_LOG'],'a') as f: f.write(json.dumps({'command':name,'args':args})+'\n')
 def finish(code=0, output=None):
- p.write_text(json.dumps(s))
+ t=p.with_name(f'{p.name}.{os.getpid()}.tmp'); t.write_text(json.dumps(s)); os.replace(t,p)  # atomic: pipeline stubs run concurrently
  if output is not None: print(output)
  sys.exit(code)
 if name=='readlink': finish(output=str(pathlib.Path(args[-1]).resolve()))
