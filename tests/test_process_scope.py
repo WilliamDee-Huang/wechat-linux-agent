@@ -51,6 +51,9 @@ if name=='systemd-run':
  if unit=='wx-wechat': s['wechat_pid']=770002
  finish()
 if name=='xdpyinfo': finish(0 if s.get('units',{}).get('wx-xvfb') else 1)
+# Allow the bounded display probe used by the independent startup fix.
+if name=='timeout' and args==['2','xdpyinfo']:
+ finish(0 if s.get('units',{}).get('wx-xvfb') else 1)
 if name=='xpra':
  if args[0]=='detach':
   if s.get('detach_failure'): finish(1)
