@@ -41,6 +41,29 @@ IBUS_BUS="$HOME/.config/ibus/bus/$MACHINE_ID"
 running() { systemctl --user is-active --quiet "$1"; }
 wechat_pid() { pgrep -u "$UID_" -x wechat | head -1; }
 
+startup_failed() {
+  echo "$1 启动失败或未就绪；请检查 journalctl --user -u $1" >&2
+  # 不自动回滚：这些组件可能属于已有会话，强行断开投屏也可能关闭微信。
+  echo "已保留运行中的组件。排查后可重试；确认可以关闭整个会话时，再手动运行 wechat-iso down。" >&2
+  return 1
+}
+
+start_unit() {
+  local unit=$1; shift
+  running "$unit" && return 0
+  # Type=exec 等到可执行文件成功启动；默认 simple 连 exec 失败也可能报成功。
+  $RUN --unit="$unit" -p Type=exec "$@" || { startup_failed "$unit"; return 1; }
+  running "$unit" || startup_failed "$unit"
+}
+
+wait_display() {
+  for _ in $(seq 1 20); do
+    DISPLAY=$D timeout 2 xdpyinfo >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  startup_failed wx-xvfb
+}
+
 overlay() {
   # WSLg 的 /tmp/.X11-unix 是只读的，且与 /mnt/wslg/.X11-unix 联动（shared mount）。
   # 先断开联动，再叠一层可写 tmpfs，否则会把桌面的 X0 一起盖掉。
@@ -95,23 +118,24 @@ ime_env() {
 }
 
 up() {
-  overlay
-  running wx-xvfb || $RUN --unit=wx-xvfb Xvfb "$D" -screen 0 "$WX_SCREEN" -nolisten tcp -noreset
-  for _ in $(seq 1 20); do DISPLAY=$D xdpyinfo >/dev/null 2>&1 && break; sleep 0.5; done
+  overlay || return 1
+  start_unit wx-xvfb Xvfb "$D" -screen 0 "$WX_SCREEN" -nolisten tcp -noreset || return 1
+  wait_display || return 1
   # --input-method=keep：不让 xpra 接管输入法；--use-display：接管已存在的 Xvfb
-  running wx-xpra || $RUN --unit=wx-xpra "${ENVS[@]}" xpra start "$D" --use-display=yes --daemon=no \
+  start_unit wx-xpra "${ENVS[@]}" xpra start "$D" --use-display=yes --daemon=no \
       --systemd-run=no --start-via-proxy=no --input-method=keep --pulseaudio=no --audio=no --speaker=off \
       --microphone=off --webcam=no --mdns=no --html=off --notifications=no --system-tray=no --printing=no \
-      --file-transfer=no --dbus-launch=no --dbus=no --exit-with-children=no --clipboard=yes
+      --file-transfer=no --dbus-launch=no --dbus=no --exit-with-children=no --clipboard=yes || return 1
   sleep 3
+  running wx-xpra || { startup_failed wx-xpra; return 1; }
   # 输入法必须先于微信就绪：微信启动时连一次输入法，连不上不会重试
   case "$WX_IME" in ibus) start_ibus ;; fcitx5) start_fcitx5 ;; esac
   if [ -z "$(wechat_pid)" ]; then
     # shellcheck disable=SC2046,SC2086
-    $RUN --unit=wx-wechat -p UnsetEnvironment=WAYLAND_DISPLAY "${ENVS[@]}" -E DISPLAY="$D" -E QT_QPA_PLATFORM=xcb \
-        -E QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 $(ime_env) $WX_CMD $WX_ARGS
+    start_unit wx-wechat -p UnsetEnvironment=WAYLAND_DISPLAY "${ENVS[@]}" -E DISPLAY="$D" -E QT_QPA_PLATFORM=xcb \
+        -E QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 $(ime_env) $WX_CMD $WX_ARGS || return 1
   fi
-  attach
+  attach || return 1
   status
 }
 
@@ -120,7 +144,7 @@ up() {
 attach() {
   # 共享内存（mmap）是本机投屏最快的通道；大小要限制，否则默认 2GB 会让 xpra 服务端 SIGBUS
   # shellcheck disable=SC2086
-  running wx-attach || $RUN --unit=wx-attach "${ENVS[@]}" -E DISPLAY="${WX_DESKTOP_DISPLAY:-:0}" -E GDK_BACKEND=x11 \
+  start_unit wx-attach "${ENVS[@]}" -E DISPLAY="${WX_DESKTOP_DISPLAY:-:0}" -E GDK_BACKEND=x11 \
       -E XPRA_MMAP_MIN_SIZE="$WX_MMAP_SIZE" -E XPRA_MMAP_MAX_SIZE="$WX_MMAP_SIZE" \
       xpra attach "$D" --mmap=yes --tray=no --notifications=no --speaker=off --microphone=off --webcam=no \
       --file-transfer=no --printing=no --splash=no $WX_ATTACH_OPTS
