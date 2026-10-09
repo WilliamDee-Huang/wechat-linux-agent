@@ -1,0 +1,168 @@
+#!/bin/bash
+# wechat-iso：把 Linux 微信放到独立的虚拟屏幕上运行，再用 xpra 投屏到桌面。
+# AI agent 在虚拟屏幕上读界面、发按键，不抢你的键盘鼠标；你通过投屏窗口照常使用微信。
+#
+# 用法: wechat-iso up | attach | detach | reattach | normal | status | down
+# 配置: ${XDG_CONFIG_HOME:-~/.config}/wechat-iso/config.sh（见 examples/config.sh）
+set -u
+
+# ---------- 默认配置（可在 config.sh 里覆盖） ----------
+WX_DISPLAY=:100                 # 虚拟屏幕编号
+WX_SCREEN=1600x1000x24          # 虚拟屏幕分辨率
+WX_CMD=/opt/wechat/wechat       # 微信启动命令（也可以是你自己的启动器）
+WX_ARGS="-platform xcb"         # 传给微信的参数
+WX_IME=ibus                     # 输入法框架：ibus | fcitx5 | none
+WX_IBUS_ENGINE=""               # 启动后切到的 ibus 引擎，例如 libpinyin、rime、msime-linux；留空则不切换
+WX_IBUS_PANEL_GUARD=1           # 1 = 候选面板预加载 pango-null-guard.so（Ubuntu 24.04 + 部分引擎会崩溃）
+WX_IBUS_WAYLAND_ALIAS=0         # 1 = 你的启动器强制设置了 WAYLAND_DISPLAY=wayland-0（见 docs/ime.md）
+WX_X11_OVERLAY=0                # 1 = 微信跑在独立网络命名空间里，需要文件形式的 X socket（WSLg，见 docs/troubleshooting.md）
+WX_MMAP_SIZE=268435456          # xpra 共享内存大小（字节）。默认 2GB 会撑爆小的 /run/user tmpfs
+WX_ATTACH_OPTS="--opengl=no --desktop-scaling=off --clipboard=yes"
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/wechat-iso/config.sh"
+# shellcheck source=/dev/null
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+SHARE="${WX_SHARE:-}"
+for d in "$SHARE" "$SELF_DIR/../share" "$HOME/.local/share/wechat-iso"; do
+  [ -n "$d" ] && [ -f "$d/winstate.py" ] && { SHARE="$(cd "$d" && pwd)"; break; }
+done
+
+D=$WX_DISPLAY
+DNUM=${D#:}
+RUN="systemd-run --user --collect --quiet"
+UID_=$(id -u)
+ENVS=(-E DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$UID_/bus}"
+      -E XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID_}" -E LANG="${LANG:-C.UTF-8}")
+MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id)
+IBUS_BUS="$HOME/.config/ibus/bus/$MACHINE_ID"
+
+running() { systemctl --user is-active --quiet "$1"; }
+wechat_pid() { pgrep -u "$UID_" -x wechat | head -1; }
+
+overlay() {
+  # WSLg 的 /tmp/.X11-unix 是只读的，且与 /mnt/wslg/.X11-unix 联动（shared mount）。
+  # 先断开联动，再叠一层可写 tmpfs，否则会把桌面的 X0 一起盖掉。
+  [ "$WX_X11_OVERLAY" = 1 ] || return 0
+  mount | grep -q 'tmpfs on /tmp/.X11-unix type tmpfs (rw' && return 0
+  sudo mount --make-private /tmp/.X11-unix &&
+  sudo mount -t tmpfs -o mode=1777 tmpfs /tmp/.X11-unix &&
+  ln -sf /mnt/wslg/.X11-unix/X0 /tmp/.X11-unix/X0
+  DISPLAY=:0 xdpyinfo >/dev/null 2>&1 || { echo "桌面显示 :0 异常，撤销叠加" >&2; sudo umount /tmp/.X11-unix; exit 1; }
+}
+
+start_ibus() {
+  # xpra 默认会自己起一个 --panel=disable 的 ibus（没有候选窗），先关掉它
+  pkill -u "$UID_" -f "ibus-daemon .*--desktop=xpra" 2>/dev/null
+  if ! running wx-ibus; then
+    local panel=()
+    if [ "$WX_IBUS_PANEL_GUARD" = 1 ] && [ -f "$SHARE/ime/ibus/pango-null-guard.so" ]; then
+      panel=(--panel="$SHARE/ime/ibus/ibus-panel.sh")
+    fi
+    # 不带 WAYLAND_DISPLAY：否则 ibus 和候选面板会走 Wayland，画不到虚拟屏幕上
+    $RUN --unit=wx-ibus -p UnsetEnvironment=WAYLAND_DISPLAY "${ENVS[@]}" -E DISPLAY="$D" -E GDK_BACKEND=x11 \
+        ibus-daemon --xim --replace "${panel[@]}"
+    local pid; pid=$(systemctl --user show -p MainPID --value wx-ibus)
+    for _ in $(seq 1 40); do grep -qs "IBUS_DAEMON_PID=$pid" "$IBUS_BUS-unix-$DNUM" && break; sleep 0.5; done
+  fi
+  if [ "$WX_IBUS_WAYLAND_ALIAS" = 1 ]; then
+    # 启动器强制 WAYLAND_DISPLAY=wayland-0 时，微信会读 …-unix-wayland-0 这个地址文件；把它指向虚拟屏幕的 ibus
+    ln -sfn "$(basename "$IBUS_BUS")-unix-$DNUM" "$IBUS_BUS-unix-wayland-0"
+  fi
+  if [ -n "$WX_IBUS_ENGINE" ]; then
+    # 有些引擎进程起得慢，多试几次
+    for _ in $(seq 1 12); do
+      [ "$(DISPLAY=$D timeout 5 ibus engine 2>/dev/null)" = "$WX_IBUS_ENGINE" ] && break
+      DISPLAY=$D timeout 15 ibus engine "$WX_IBUS_ENGINE" 2>/dev/null; sleep 2
+    done
+  fi
+}
+
+start_fcitx5() {
+  # 实验性，未充分测试：fcitx5 走 D-Bus 会话总线，和桌面上已运行的 fcitx5 会冲突（见 docs/ime.md）
+  running wx-ime || $RUN --unit=wx-ime -p UnsetEnvironment=WAYLAND_DISPLAY "${ENVS[@]}" -E DISPLAY="$D" \
+      -E GDK_BACKEND=x11 fcitx5 --replace
+  sleep 2
+}
+
+ime_env() {
+  case "$WX_IME" in
+    ibus)   echo "-E QT_IM_MODULE=ibus -E GTK_IM_MODULE=ibus -E XMODIFIERS=@im=ibus" ;;
+    fcitx5) echo "-E QT_IM_MODULE=fcitx -E GTK_IM_MODULE=fcitx -E XMODIFIERS=@im=fcitx" ;;
+    *)      echo "" ;;
+  esac
+}
+
+up() {
+  overlay
+  running wx-xvfb || $RUN --unit=wx-xvfb Xvfb "$D" -screen 0 "$WX_SCREEN" -nolisten tcp -noreset
+  for _ in $(seq 1 20); do DISPLAY=$D xdpyinfo >/dev/null 2>&1 && break; sleep 0.5; done
+  # --input-method=keep：不让 xpra 接管输入法；--use-display：接管已存在的 Xvfb
+  running wx-xpra || $RUN --unit=wx-xpra "${ENVS[@]}" xpra start "$D" --use-display=yes --daemon=no \
+      --systemd-run=no --start-via-proxy=no --input-method=keep --pulseaudio=no --audio=no --speaker=off \
+      --microphone=off --webcam=no --mdns=no --html=off --notifications=no --system-tray=no --printing=no \
+      --file-transfer=no --dbus-launch=no --dbus=no --exit-with-children=no --clipboard=yes
+  sleep 3
+  # 输入法必须先于微信就绪：微信启动时连一次输入法，连不上不会重试
+  case "$WX_IME" in ibus) start_ibus ;; fcitx5) start_fcitx5 ;; esac
+  if [ -z "$(wechat_pid)" ]; then
+    # shellcheck disable=SC2046,SC2086
+    $RUN --unit=wx-wechat -p UnsetEnvironment=WAYLAND_DISPLAY "${ENVS[@]}" -E DISPLAY="$D" -E QT_QPA_PLATFORM=xcb \
+        -E QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 $(ime_env) $WX_CMD $WX_ARGS
+  fi
+  attach
+  status
+}
+
+# 断开投屏只能用 xpra detach。不要 systemctl stop/restart wx-attach：
+# 投屏客户端被强行结束时会请求关闭窗口，xpra 随即结束微信进程。
+attach() {
+  # 共享内存（mmap）是本机投屏最快的通道；大小要限制，否则默认 2GB 会让 xpra 服务端 SIGBUS
+  # shellcheck disable=SC2086
+  running wx-attach || $RUN --unit=wx-attach "${ENVS[@]}" -E DISPLAY="${WX_DESKTOP_DISPLAY:-:0}" -E GDK_BACKEND=x11 \
+      -E XPRA_MMAP_MIN_SIZE="$WX_MMAP_SIZE" -E XPRA_MMAP_MAX_SIZE="$WX_MMAP_SIZE" \
+      xpra attach "$D" --mmap=yes --tray=no --notifications=no --speaker=off --microphone=off --webcam=no \
+      --file-transfer=no --printing=no --splash=no $WX_ATTACH_OPTS
+}
+detach() {
+  xpra detach "$D" >/dev/null 2>&1
+  for _ in $(seq 1 20); do running wx-attach || return 0; sleep 0.5; done
+  echo "投屏没有断开" >&2; return 1
+}
+reattach() { detach && attach; }
+
+# 窗口卡在最大化/最小化时恢复成普通窗口。WSLg 不理会投屏窗口的“还原”和“最小化”请求，
+# 所以在虚拟屏幕这一侧直接改。
+normal() {
+  local w; w=$(DISPLAY=$D xdotool search --name '^Weixin$' | head -1)
+  [ -n "$w" ] || { echo "找不到微信窗口" >&2; return 1; }
+  xpra control "$D" map "$w" >/dev/null 2>&1
+  DISPLAY=$D GDK_BACKEND=x11 python3 "$SHARE/winstate.py" "$w" unmaximize 2>/dev/null
+  sleep 1; DISPLAY=$D xprop -id "$w" _NET_WM_STATE
+}
+
+status() {
+  for u in wx-xvfb wx-xpra wx-ibus wx-ime wx-wechat wx-attach; do
+    systemctl --user cat "$u" >/dev/null 2>&1 || [ "$u" = wx-xvfb ] || continue
+    printf '%-10s %s\n' "$u" "$(systemctl --user is-active "$u")"
+  done
+  [ "$WX_IME" = ibus ] && printf '%-10s %s\n' engine "$(DISPLAY=$D timeout 5 ibus engine 2>/dev/null)"
+  printf '%-10s %s\n' wechat "$(wechat_pid || echo '-')"
+}
+
+down() {
+  detach
+  pid=$(wechat_pid); [ -n "$pid" ] && kill "$pid"
+  for u in wx-attach wx-wechat wx-ibus wx-ime wx-xpra wx-xvfb; do systemctl --user stop "$u" 2>/dev/null; done
+  [ -L "$IBUS_BUS-unix-wayland-0" ] && rm -f "$IBUS_BUS-unix-wayland-0"
+  if [ "$WX_X11_OVERLAY" = 1 ] && mount | grep -q 'tmpfs on /tmp/.X11-unix type tmpfs (rw'; then
+    sudo umount /tmp/.X11-unix
+  fi
+  status
+}
+
+case "${1:-status}" in
+  up|attach|detach|reattach|normal|status|down) "${1:-status}" ;;
+  *) echo "用法: wechat-iso up|attach|detach|reattach|normal|status|down" >&2; exit 2 ;;
+esac
