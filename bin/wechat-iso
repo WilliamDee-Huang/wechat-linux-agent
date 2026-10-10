@@ -39,7 +39,14 @@ MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id)
 IBUS_BUS="$HOME/.config/ibus/bus/$MACHINE_ID"
 
 running() { systemctl --user is-active --quiet "$1"; }
-wechat_pid() { pgrep -u "$UID_" -x wechat | head -1; }
+# 只查询受管理的服务；同一用户在桌面上运行的微信不属于这个实例。
+# 自定义启动器可能是 MainPID，因此启动/停止以 unit 为边界，不按进程名找 PID。
+wechat_pid() {
+  local pid
+  pid=$(systemctl --user show -p MainPID --value wx-wechat 2>/dev/null) || return 1
+  case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$pid"
+}
 
 overlay() {
   # WSLg 的 /tmp/.X11-unix 是只读的，且与 /mnt/wslg/.X11-unix 联动（shared mount）。
@@ -106,7 +113,7 @@ up() {
   sleep 3
   # 输入法必须先于微信就绪：微信启动时连一次输入法，连不上不会重试
   case "$WX_IME" in ibus) start_ibus ;; fcitx5) start_fcitx5 ;; esac
-  if [ -z "$(wechat_pid)" ]; then
+  if ! running wx-wechat; then
     # shellcheck disable=SC2046,SC2086
     $RUN --unit=wx-wechat -p UnsetEnvironment=WAYLAND_DISPLAY "${ENVS[@]}" -E DISPLAY="$D" -E QT_QPA_PLATFORM=xcb \
         -E QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 $(ime_env) $WX_CMD $WX_ARGS
@@ -153,7 +160,7 @@ status() {
 
 down() {
   detach
-  pid=$(wechat_pid); [ -n "$pid" ] && kill "$pid"
+  # systemd 按 wx-wechat 的 cgroup 停止启动器及其子进程，避免误杀桌面微信。
   for u in wx-attach wx-wechat wx-ibus wx-ime wx-xpra wx-xvfb; do systemctl --user stop "$u" 2>/dev/null; done
   [ -L "$IBUS_BUS-unix-wayland-0" ] && rm -f "$IBUS_BUS-unix-wayland-0"
   if [ "$WX_X11_OVERLAY" = 1 ] && mount | grep -q 'tmpfs on /tmp/.X11-unix type tmpfs (rw'; then
