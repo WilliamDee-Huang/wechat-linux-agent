@@ -7,7 +7,7 @@ python3 tests/test_startup.py
 bash -n bin/wechat-iso
 ```
 
-The suite has 11 test methods covering 20 scenarios. It checks successful and
+The suite checks successful and
 repeated startup, failed launch requests for each of Xvfb/xpra/WeChat/attach,
 failed executable startup, immediate service exits, display readiness retries
 and exhaustion, xpra exiting during the startup wait, standalone attach, and
@@ -57,6 +57,10 @@ handshake or WeChat GUI readiness is claimed, and a service can fail after a
 successful check. `StartupTests` use `WX_IME=none`; `IbusStartupTests` use
 `WX_IME=ibus` (no engine switch, no panel guard) and check that a failed
 `wx-ibus` launch or a missing ibus address file stops startup before WeChat.
-fcitx5 startup and the X11 overlay remain unvalidated. The
+Additional IME readiness cases reject missing/invalid/failed MainPID lookups,
+stale PID prefixes, commented PID lines, and ibus exiting after its address file
+was written. A matching address file plus an active service succeeds. fcitx5
+must remain active after its startup delay. These are synthetic service/address
+file checks; real IME integration and the X11 overlay remain unvalidated. The
 independent same-user process-selection issue and shutdown error behavior are
 outside this change.

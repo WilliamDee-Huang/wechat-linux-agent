@@ -23,6 +23,7 @@ UNITS = ["wx-xvfb", "wx-xpra", "wx-wechat", "wx-attach"]
 STUB = r'''
 import json
 import os
+import re
 from pathlib import Path
 import sys
 
@@ -51,6 +52,8 @@ if name == "seq": finish(output="\n".join(map(str, range(int(args[0]), int(args[
 if name == "sleep":
     if args == ["3"] and state.get("xpra_exits_during_startup"):
         state.setdefault("units", {})["wx-xpra"] = False
+    if args == ["2"] and state.get("fcitx5_exits_during_startup"):
+        state.setdefault("units", {})["wx-ime"] = False
     finish()
 if name == "pgrep":
     pid = state.get("wechat_pid")
@@ -67,7 +70,8 @@ if name == "systemctl":
                None if "--quiet" in options else ("active" if active else "inactive"))
     if operation == "cat": finish(0 if unit in state.get("units", {}) else 1)
     if operation == "show" and unit == "wx-ibus":
-        finish(output="880003" if state.get("units", {}).get(unit) else "0")
+        finish(state.get("ibus_show_error", 0),
+               output=state.get("ibus_main_pid", "880003" if state.get("units", {}).get(unit) else "0"))
     if operation == "show" and unit == "wx-wechat":
         finish(output=str(state.get("wechat_pid", 0)
                           if state.get("units", {}).get(unit) else 0))
@@ -95,8 +99,19 @@ if name == "xdpyinfo":
 if name == "pkill" and "ibus-daemon .*--desktop=xpra" in args:
     finish(1)  # 没有 xpra 自带的 ibus 需要清理
 if name == "grep" and any(arg.startswith("IBUS_DAEMON_PID=") for arg in args):
-    # ibus 写好虚拟屏幕地址文件
-    finish(0 if state.get("units", {}).get("wx-ibus") and not state.get("ibus_never_ready") else 1)
+    # Match synthetic address-file lines, including grep's exact/fixed flags.
+    pattern = next(arg for arg in args if arg.startswith("IBUS_DAEMON_PID="))
+    flags = "".join(arg[1:] for arg in args if arg.startswith("-"))
+    # grep treats embedded newlines as alternative patterns.
+    patterns = pattern.split("\n")
+    if "F" in flags: patterns = [re.escape(item) for item in patterns]
+    match = re.fullmatch if "x" in flags else re.search
+    content = state.get("ibus_address", "IBUS_DAEMON_PID=880003\n")
+    ready = not state.get("ibus_never_ready") and any(
+        match(item, line) for item in patterns for line in content.splitlines())
+    if state.get("ibus_exits_during_readiness"):
+        state.setdefault("units", {})["wx-ibus"] = False
+    finish(0 if ready else 1)
 if name == "timeout" and args[1:3] == ["ibus", "engine"]:
     finish(output="")  # status 查询当前引擎
 if name == "xpra":
@@ -125,7 +140,7 @@ def scenario(actions=("up",), state=None, config_extra=""):
             'WX_CMD=/synthetic/wechat\nWX_ARGS=""\nWX_DISPLAY=:100\n' + config_extra
         )
         stub = mock_bin / "stub"
-        stub.write_text("#!" + sys.executable + "\n" + STUB)
+        stub.write_text("#!" + sys.executable + " -S\n" + STUB)
         stub.chmod(0o755)
         for name in NAMES:
             (mock_bin / name).symlink_to(stub)
@@ -151,7 +166,7 @@ def scenario(actions=("up",), state=None, config_extra=""):
                 str(SCRIPT), action,
             ]
             runs.append(subprocess.run(command, env=environment, cwd=root,
-                                       text=True, capture_output=True, timeout=20))
+                                       text=True, capture_output=True, timeout=60))
         calls = [json.loads(line) for line in log_path.read_text().splitlines()]
         return runs, calls, json.loads(state_path.read_text())
 
@@ -298,6 +313,49 @@ class IbusStartupTests(unittest.TestCase):
         self.assertEqual(sum(call["command"] == "grep" for call in calls), 40)
         self.assertIn("journalctl --user -u wx-ibus", runs[0].stderr)
         self.assert_safe(calls, state)
+
+
+class ImeReadinessTests(unittest.TestCase):
+    def check(self, state, config=IBUS_CONFIG, success=False):
+        runs, calls, final = scenario(state={"units": {}, **state}, config_extra=config)
+        self.assertFalse(final.get("unexpected"), final.get("unexpected"))
+        self.assertFalse(final.get("kill_requests"))
+        self.assertEqual(runs[0].returncode == 0, success, runs[0].stderr)
+        ime_unit = "wx-ime" if "WX_IME=fcitx5" in config else "wx-ibus"
+        expected = ["wx-xvfb", "wx-xpra", ime_unit]
+        if success:
+            expected += ["wx-wechat", "wx-attach"]
+        else:
+            self.assertEqual(runs[0].stdout, "")
+            self.assertIn("journalctl --user -u " + ime_unit, runs[0].stderr)
+        self.assertEqual(launched(calls), expected)
+        return calls
+
+    def test_stale_pid_prefix_is_not_ready(self):
+        self.check({"ibus_address": "IBUS_DAEMON_PID=8800030\n"})
+
+    def test_commented_pid_is_not_ready(self):
+        self.check({"ibus_address": "# IBUS_DAEMON_PID=880003\n"})
+
+    def test_invalid_or_missing_main_pid_is_not_ready(self):
+        for pid in ("", "0", "-1", "n/a", "880003\n880004"):
+            with self.subTest(pid=pid):
+                self.check({"ibus_main_pid": pid, "ibus_address": "IBUS_DAEMON_PID=" + pid + "\n"})
+
+    def test_failed_pid_lookup_is_not_ready(self):
+        self.check({"ibus_show_error": 1})
+
+    def test_ibus_exit_after_address_write_is_not_ready(self):
+        self.check({"ibus_exits_during_readiness": True})
+
+    def test_exact_pid_in_address_file_is_ready(self):
+        self.check({"ibus_address": "IBUS_ADDRESS=synthetic\nIBUS_DAEMON_PID=880003\n"}, success=True)
+
+    def test_fcitx5_exit_during_wait_stops_wechat(self):
+        self.check({"fcitx5_exits_during_startup": True}, config="WX_IME=fcitx5\n")
+
+    def test_fcitx5_active_after_wait_starts_wechat(self):
+        self.check({}, config="WX_IME=fcitx5\n", success=True)
 
 
 if __name__ == "__main__":
