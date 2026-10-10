@@ -95,12 +95,14 @@ start_ibus() {
         ibus-daemon --xim --replace "${panel[@]}" || return 1
   fi
   # 等 ibus 写好虚拟屏幕的地址文件；没写好就启动微信，微信会连不上输入法且不再重试
-  local pid ready=0; pid=$(systemctl --user show -p MainPID --value wx-ibus)
+  local pid ready=0
+  pid=$(systemctl --user show -p MainPID --value wx-ibus) || { startup_failed wx-ibus; return 1; }
+  case "$pid" in ''|0|*[!0-9]*) startup_failed wx-ibus; return 1 ;; esac
   for _ in $(seq 1 40); do
-    grep -qs "IBUS_DAEMON_PID=$pid" "$IBUS_BUS-unix-$DNUM" && { ready=1; break; }
+    grep -Fqxs "IBUS_DAEMON_PID=$pid" "$IBUS_BUS-unix-$DNUM" && { ready=1; break; }
     sleep 0.5
   done
-  [ "$ready" = 1 ] || { startup_failed wx-ibus; return 1; }
+  [ "$ready" = 1 ] && running wx-ibus || { startup_failed wx-ibus; return 1; }
   if [ "$WX_IBUS_WAYLAND_ALIAS" = 1 ]; then
     # 启动器强制 WAYLAND_DISPLAY=wayland-0 时，微信会读 …-unix-wayland-0 这个地址文件；把它指向虚拟屏幕的 ibus
     ln -sfn "$(basename "$IBUS_BUS")-unix-$DNUM" "$IBUS_BUS-unix-wayland-0"
@@ -122,6 +124,7 @@ start_fcitx5() {
   start_unit wx-ime -p UnsetEnvironment=WAYLAND_DISPLAY "${ENVS[@]}" -E DISPLAY="$D" \
       -E GDK_BACKEND=x11 fcitx5 --replace || return 1
   sleep 2
+  running wx-ime || startup_failed wx-ime
 }
 
 ime_env() {
