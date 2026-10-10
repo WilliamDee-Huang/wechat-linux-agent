@@ -42,7 +42,12 @@ if name=='systemctl':
   s.setdefault('units',{})[unit]=False
   if unit=='wx-wechat': s.pop('wechat_pid',None)
   finish()
- if op=='show': finish(s.get('show_error',0), s.get('main_pid',str(s.get('wechat_pid',0))))
+ if op=='show':
+  prop=a[a.index('-p')+1]
+  if prop=='ActiveState': finish(s.get('show_error',0), 'active' if s.get('units',{}).get(unit) else 'inactive')
+  if prop=='LoadState': finish(s.get('show_error',0), 'loaded' if unit in s.get('units',{}) else 'not-found')
+  if prop=='MainPID': finish(s.get('show_error',0), s.get('main_pid',str(s.get('wechat_pid',0))))
+  finish(90)
  finish(90)
 if name=='systemd-run':
  unit=next(x.split('=',1)[1] for x in args if x.startswith('--unit='))
@@ -81,7 +86,7 @@ def scenario(actions, state=None):
         config.mkdir(parents=True)
         (config / 'config.sh').write_text('WX_IME=none\nWX_X11_OVERLAY=0\nWX_IBUS_WAYLAND_ALIAS=0\nWX_CMD=/synthetic/wechat\nWX_ARGS=""\n')
         stub = bin_dir / 'stub'
-        stub.write_text('#!' + sys.executable + '\n' + STUB)
+        stub.write_text('#!' + sys.executable + ' -S\n' + STUB)
         stub.chmod(0o755)
         for name in NAMES:
             (bin_dir / name).symlink_to(stub)
@@ -102,9 +107,9 @@ def scenario(actions, state=None):
             # Never delegate to Bash's kill builtin, even when testing old code.
             runs.append(subprocess.run([
                 '/usr/bin/bash', '--noprofile', '--norc', '-c',
-                'kill() { "$FIXTURE_BIN/kill" "$@"; }; source "$0" "$1"',
+                'enable -n kill; kill() { "$FIXTURE_BIN/kill" "$@"; }; source "$0" "$1"',
                 str(SCRIPT), action,
-            ], env=env, text=True, capture_output=True, timeout=20))
+            ], env=env, cwd=root, text=True, capture_output=True, timeout=60))
         calls = [json.loads(line) for line in log.read_text().splitlines()]
         return runs, calls, json.loads(state_path.read_text())
 
@@ -149,10 +154,12 @@ class ProcessScopeTests(unittest.TestCase):
         self.assertFalse(any(call['command'] == 'pgrep' for call in calls))
 
     def test_down_without_managed_client_leaves_external_process(self):
-        _, calls, state = scenario(['down'], {'units': {}, 'external_pid': 880001})
+        runs, calls, state = scenario(['down'], {'units': {}, 'external_pid': 880001})
+        self.assertEqual(runs[0].returncode, 0, runs[0].stderr)
         self.assertEqual(state['external_pid'], 880001)
         self.assertFalse(state.get('kill_requests'))
-        self.assertIn(['--user', 'stop', 'wx-wechat'], [call['args'] for call in calls if call['command'] == 'systemctl'])
+        # A collected/never-started unit is already down; no stop is necessary.
+        self.assertNotIn(['--user', 'stop', 'wx-wechat'], [call['args'] for call in calls if call['command'] == 'systemctl'])
 
 if __name__ == '__main__':
     unittest.main()

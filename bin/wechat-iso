@@ -164,10 +164,29 @@ attach() {
       xpra attach "$D" --mmap=yes --tray=no --notifications=no --speaker=off --microphone=off --webcam=no \
       --file-transfer=no --printing=no --splash=no $WX_ATTACH_OPTS
 }
+# 0 = 已停止（包括被 --collect 回收的 unit），1 = 尚未停止，2 = 状态不明。
+# is-active 的非零值也可能表示查询失败或正在停止，不能据此拆掉显示环境。
+unit_stopped() {
+  local state
+  state=$(systemctl --user show -p ActiveState --value "$1") || return 2
+  case "$state" in
+    inactive|failed) return 0 ;;
+    active|activating|deactivating|reloading|refreshing|maintenance) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
 detach() {
-  xpra detach "$D" >/dev/null 2>&1
-  for _ in $(seq 1 20); do running wx-attach || return 0; sleep 0.5; done
-  echo "投屏没有断开" >&2; return 1
+  local detach_rc=0 state_rc
+  xpra detach "$D" >/dev/null 2>&1 || detach_rc=$?
+  for _ in $(seq 1 20); do
+    state_rc=0; unit_stopped wx-attach || state_rc=$?
+    # 没有客户端时 xpra detach 可能失败，但已经断开就是成功。
+    [ "$state_rc" = 0 ] && return 0
+    [ "$state_rc" = 1 ] && [ "$detach_rc" = 0 ] || break
+    sleep 0.5
+  done
+  echo "wx-attach 投屏没有断开或状态无法确认" >&2; return 1
 }
 reattach() { detach && attach; }
 
@@ -190,13 +209,42 @@ status() {
   printf '%-10s %s\n' wechat "$(wechat_pid || echo '-')"
 }
 
+shutdown_failed() {
+  echo "$1 停止失败或状态无法确认；请检查 journalctl --user -u $1" >&2
+  echo "已停止后续关闭和清理。请排查后重试 wechat-iso down。" >&2
+  return 1
+}
+
+stop_unit() {
+  local state_rc=0 load_state
+  unit_stopped "$1" || state_rc=$?
+  [ "$state_rc" = 0 ] && return 0
+  [ "$state_rc" = 1 ] || { shutdown_failed "$1"; return 1; }
+  if ! systemctl --user stop "$1"; then
+    # --collect 可能在查询后、stop 前回收 unit；只有确认不存在时才忽略失败。
+    load_state=$(systemctl --user show -p LoadState --value "$1") || { shutdown_failed "$1"; return 1; }
+    [ "$load_state" = not-found ] || { shutdown_failed "$1"; return 1; }
+  fi
+  unit_stopped "$1" || shutdown_failed "$1"
+}
+
 down() {
-  detach
+  local u mounts
+  local units=(wx-attach wx-wechat wx-ibus wx-ime wx-xpra wx-xvfb)
+  detach || return 1
   # systemd 按 wx-wechat 的 cgroup 停止启动器及其子进程，避免误杀桌面微信。
-  for u in wx-attach wx-wechat wx-ibus wx-ime wx-xpra wx-xvfb; do systemctl --user stop "$u" 2>/dev/null; done
-  [ -L "$IBUS_BUS-unix-wayland-0" ] && rm -f "$IBUS_BUS-unix-wayland-0"
-  if [ "$WX_X11_OVERLAY" = 1 ] && mount | grep -q 'tmpfs on /tmp/.X11-unix type tmpfs (rw'; then
-    sudo umount /tmp/.X11-unix
+  # 上游组件没停下来时，不继续停止其输入法/显示依赖，也不卸载 overlay。
+  for u in "${units[@]}"; do stop_unit "$u" || return 1; done
+  # 清理之前再确认一次；查询失败也保留共享资源。
+  for u in "${units[@]}"; do unit_stopped "$u" || { shutdown_failed "$u"; return 1; }; done
+  if [ -L "$IBUS_BUS-unix-wayland-0" ]; then
+    rm -f "$IBUS_BUS-unix-wayland-0" || return 1
+  fi
+  if [ "$WX_X11_OVERLAY" = 1 ]; then
+    mounts=$(mount) || { echo "无法查询 X11 overlay 挂载状态" >&2; return 1; }
+    if [[ "$mounts" == *'tmpfs on /tmp/.X11-unix type tmpfs (rw'* ]]; then
+      sudo umount /tmp/.X11-unix || return 1
+    fi
   fi
   status
 }
